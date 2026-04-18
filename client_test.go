@@ -147,7 +147,7 @@ func TestIsConnected_True(t *testing.T) {
 	AmIConnectedURL = srv.URL
 	t.Cleanup(func() { AmIConnectedURL = orig })
 
-	ok, err := IsConnected()
+	ok, err := IsConnected(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +169,7 @@ func TestIsConnected_False(t *testing.T) {
 	AmIConnectedURL = srv.URL
 	t.Cleanup(func() { AmIConnectedURL = orig })
 
-	ok, err := IsConnected()
+	ok, err := IsConnected(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,7 +190,7 @@ func TestIsConnected_ErrorOnNon2xx(t *testing.T) {
 	AmIConnectedURL = srv.URL
 	t.Cleanup(func() { AmIConnectedURL = orig })
 
-	if _, err := IsConnected(); err == nil {
+	if _, err := IsConnected(t.Context()); err == nil {
 		t.Fatal("expected error on 503")
 	}
 }

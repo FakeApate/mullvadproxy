@@ -4,13 +4,19 @@
 package mullvadproxy
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"time"
 )
+
+// httpClient is the shared client used for all outbound Mullvad API calls.
+// Timeout covers the full request; per-call cancellation is via context.
+var httpClient = &http.Client{Timeout: 30 * time.Second}
 
 // metadata stores the ETag and Last-Modified values from the last successful fetch,
 // persisted to disk so freshness checks survive restarts.
@@ -24,12 +30,18 @@ type metadata struct {
 // Last-Modified indicates newer content. On cold start (Relays == nil) it
 // prefers the on-disk cache and only falls back to a network fetch if that
 // cache is missing or corrupt.
-func update(cfg MullvadConfig) error {
-	resp, err := http.Head(cfg.RelayURL)
+func update(ctx context.Context, cfg MullvadConfig) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, cfg.RelayURL, nil)
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	if err := resp.Body.Close(); err != nil {
+		return err
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("HEAD %s: status %d", cfg.RelayURL, resp.StatusCode)
 	}
@@ -43,7 +55,7 @@ func update(cfg MullvadConfig) error {
 		(!remoteLastModified.IsZero() && remoteLastModified.After(meta.LastModified))
 
 	if remoteIsNewer {
-		if err := fetch(cfg, remoteETag, remoteLastModified); err != nil {
+		if err := fetch(ctx, cfg, remoteETag, remoteLastModified); err != nil {
 			return err
 		}
 		return parse(cfg)
@@ -53,7 +65,7 @@ func update(cfg MullvadConfig) error {
 		if err := parse(cfg); err == nil {
 			return nil
 		}
-		if err := fetch(cfg, remoteETag, remoteLastModified); err != nil {
+		if err := fetch(ctx, cfg, remoteETag, remoteLastModified); err != nil {
 			return err
 		}
 		return parse(cfg)
@@ -65,12 +77,16 @@ func update(cfg MullvadConfig) error {
 // fetch downloads the relay list, writes it to cfg.DataFile, and records the
 // supplied etag and lastModified to cfg.MetaFile so the next update call can
 // short-circuit when the remote has not changed.
-func fetch(cfg MullvadConfig, etag string, lastModified time.Time) error {
-	resp, err := http.Get(cfg.RelayURL)
+func fetch(ctx context.Context, cfg MullvadConfig, etag string, lastModified time.Time) (err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cfg.RelayURL, nil)
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, resp.Body.Close()) }()
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -113,6 +129,8 @@ func loadMeta(cfg MullvadConfig) metadata {
 		return metadata{}
 	}
 	var meta metadata
-	json.Unmarshal(data, &meta)
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return metadata{}
+	}
 	return meta
 }

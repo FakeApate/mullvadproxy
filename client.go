@@ -15,11 +15,11 @@
 package mullvadproxy
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -35,33 +35,53 @@ var Relays *MullvadRelays
 // Exposed as a variable so tests can point it at an httptest server.
 var AmIConnectedURL = "https://am.i.mullvad.net/json"
 
-// StartUpdater performs an initial relay list update and then checks for updates
-// at the interval specified by cfg.UpdateInterval.
-// It returns immediately after the first update; subsequent checks run in the background.
-func StartUpdater(cfg MullvadConfig) {
-	if err := update(cfg); err != nil {
-		log.Printf("mullvad: initial update failed: %v", err)
-	}
+// StartUpdater runs an initial relay list update, then refreshes on
+// cfg.UpdateInterval until ctx is canceled. Errors from every update
+// attempt (initial and scheduled) are sent on the returned channel;
+// the channel is closed when ctx is done. Consumers that do not want
+// errors can drain or ignore the channel — the buffer is small, so
+// persistent backpressure drops errors rather than blocking updates.
+func StartUpdater(ctx context.Context, cfg MullvadConfig) <-chan error {
+	errs := make(chan error, 1)
 	go func() {
+		defer close(errs)
+		send := func(err error) {
+			if err == nil {
+				return
+			}
+			select {
+			case errs <- err:
+			default:
+			}
+		}
+		send(update(ctx, cfg))
 		ticker := time.NewTicker(cfg.UpdateInterval)
 		defer ticker.Stop()
-		for range ticker.C {
-			if err := update(cfg); err != nil {
-				log.Printf("mullvad: update failed: %v", err)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				send(update(ctx, cfg))
 			}
 		}
 	}()
+	return errs
 }
 
 // IsConnected queries [AmIConnectedURL] and reports whether the current
 // egress IP is a Mullvad exit. It returns an error if the request fails,
 // the response status is non-2xx, or the body cannot be decoded.
-func IsConnected() (bool, error) {
-	resp, err := http.Get(AmIConnectedURL)
+func IsConnected(ctx context.Context) (connected bool, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, AmIConnectedURL, nil)
 	if err != nil {
 		return false, err
 	}
-	defer resp.Body.Close()
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer func() { err = errors.Join(err, resp.Body.Close()) }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return false, fmt.Errorf("am.i.mullvad.net: status %d", resp.StatusCode)
 	}

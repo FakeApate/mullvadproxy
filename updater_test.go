@@ -32,7 +32,8 @@ func newTestCfg(t *testing.T, url string) MullvadConfig {
 
 // newServer returns a server whose HEAD returns etag/lastMod and GET returns relayJSON,
 // plus counters for HEAD and GET calls.
-func newServer(etag, lastMod string) (*httptest.Server, *int, *int) {
+func newServer(t *testing.T, etag, lastMod string) (*httptest.Server, *int, *int) {
+	t.Helper()
 	var headCount, getCount int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if etag != "" {
@@ -46,7 +47,9 @@ func newServer(etag, lastMod string) (*httptest.Server, *int, *int) {
 			headCount++
 		case http.MethodGet:
 			getCount++
-			w.Write([]byte(relayJSON))
+			if _, err := w.Write([]byte(relayJSON)); err != nil {
+				t.Errorf("test server write: %v", err)
+			}
 		}
 	}))
 	return srv, &headCount, &getCount
@@ -57,11 +60,11 @@ func newServer(etag, lastMod string) (*httptest.Server, *int, *int) {
 // and every SelectProxies call failing.
 func TestUpdate_FetchesWhenNoCache(t *testing.T) {
 	Relays = nil
-	srv, _, getCount := newServer(`"v1"`, time.Now().UTC().Format(time.RFC1123))
+	srv, _, getCount := newServer(t, `"v1"`, time.Now().UTC().Format(time.RFC1123))
 	defer srv.Close()
 	cfg := newTestCfg(t, srv.URL)
 
-	if err := update(cfg); err != nil {
+	if err := update(t.Context(), cfg); err != nil {
 		t.Fatal(err)
 	}
 	if *getCount != 1 {
@@ -82,7 +85,7 @@ func TestUpdate_FetchesWhenNoCache(t *testing.T) {
 func TestUpdate_UsesDiskCacheWhenETagMatches(t *testing.T) {
 	Relays = nil
 	etag := `"v1"`
-	srv, _, getCount := newServer(etag, "")
+	srv, _, getCount := newServer(t, etag, "")
 	defer srv.Close()
 	cfg := newTestCfg(t, srv.URL)
 
@@ -90,12 +93,15 @@ func TestUpdate_UsesDiskCacheWhenETagMatches(t *testing.T) {
 	if err := os.WriteFile(cfg.DataFile, []byte(relayJSON), 0644); err != nil {
 		t.Fatal(err)
 	}
-	metaBytes, _ := json.Marshal(metadata{ETag: etag})
+	metaBytes, err := json.Marshal(metadata{ETag: etag})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(cfg.MetaFile, metaBytes, 0644); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := update(cfg); err != nil {
+	if err := update(t.Context(), cfg); err != nil {
 		t.Fatal(err)
 	}
 	if *getCount != 0 {
@@ -113,13 +119,18 @@ func TestUpdate_UsesDiskCacheWhenETagMatches(t *testing.T) {
 func TestUpdate_SkipsWhenRelaysLoadedAndETagMatches(t *testing.T) {
 	Relays = makeRelays()
 	etag := `"v2"`
-	srv, _, getCount := newServer(etag, "")
+	srv, _, getCount := newServer(t, etag, "")
 	defer srv.Close()
 	cfg := newTestCfg(t, srv.URL)
-	metaBytes, _ := json.Marshal(metadata{ETag: etag})
-	os.WriteFile(cfg.MetaFile, metaBytes, 0644)
+	metaBytes, err := json.Marshal(metadata{ETag: etag})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfg.MetaFile, metaBytes, 0644); err != nil {
+		t.Fatal(err)
+	}
 
-	if err := update(cfg); err != nil {
+	if err := update(t.Context(), cfg); err != nil {
 		t.Fatal(err)
 	}
 	if *getCount != 0 {
@@ -133,13 +144,18 @@ func TestUpdate_SkipsWhenRelaysLoadedAndETagMatches(t *testing.T) {
 // Mullvad publishes a new list.
 func TestUpdate_FetchesWhenETagChanged(t *testing.T) {
 	Relays = makeRelays()
-	srv, _, getCount := newServer(`"new"`, "")
+	srv, _, getCount := newServer(t, `"new"`, "")
 	defer srv.Close()
 	cfg := newTestCfg(t, srv.URL)
-	metaBytes, _ := json.Marshal(metadata{ETag: `"old"`})
-	os.WriteFile(cfg.MetaFile, metaBytes, 0644)
+	metaBytes, err := json.Marshal(metadata{ETag: `"old"`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfg.MetaFile, metaBytes, 0644); err != nil {
+		t.Fatal(err)
+	}
 
-	if err := update(cfg); err != nil {
+	if err := update(t.Context(), cfg); err != nil {
 		t.Fatal(err)
 	}
 	if *getCount != 1 {
@@ -159,7 +175,7 @@ func TestUpdate_ReturnsErrorOnHTTPFailure(t *testing.T) {
 	defer srv.Close()
 	cfg := newTestCfg(t, srv.URL)
 
-	if err := update(cfg); err == nil {
+	if err := update(t.Context(), cfg); err == nil {
 		t.Fatal("expected error on 500")
 	}
 }
@@ -180,7 +196,9 @@ func TestLoadMeta_MissingFileReturnsZero(t *testing.T) {
 // rather than silently leaving Relays nil.
 func TestParse_InvalidJSONReturnsError(t *testing.T) {
 	cfg := newTestCfg(t, "http://unused")
-	os.WriteFile(cfg.DataFile, []byte("not json"), 0644)
+	if err := os.WriteFile(cfg.DataFile, []byte("not json"), 0644); err != nil {
+		t.Fatal(err)
+	}
 	if err := parse(cfg); err == nil {
 		t.Fatal("expected parse error")
 	}
