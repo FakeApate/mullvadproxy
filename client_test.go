@@ -1,11 +1,15 @@
 package mullvadproxy
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"regexp"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func makeRelays() *MullvadRelays {
@@ -178,6 +182,36 @@ func TestIsConnected_False(t *testing.T) {
 	}
 }
 
+// Transport failure (unreachable host) must surface as an error. Silently
+// returning false would be indistinguishable from "connected via a non-Mullvad
+// exit" and lead callers to wrong conclusions during outages.
+func TestIsConnected_TransportError(t *testing.T) {
+	orig := AmIConnectedURL
+	AmIConnectedURL = "http://127.0.0.1:1"
+	t.Cleanup(func() { AmIConnectedURL = orig })
+
+	if _, err := IsConnected(t.Context()); err == nil {
+		t.Fatal("expected transport error")
+	}
+}
+
+// Malformed body (non-JSON or JSON missing required field) must propagate
+// the decode error rather than defaulting to a false "not connected" result.
+func TestIsConnected_MalformedBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("not json"))
+	}))
+	defer srv.Close()
+
+	orig := AmIConnectedURL
+	AmIConnectedURL = srv.URL
+	t.Cleanup(func() { AmIConnectedURL = orig })
+
+	if _, err := IsConnected(t.Context()); err == nil {
+		t.Fatal("expected decode error")
+	}
+}
+
 // Non-2xx responses must surface as errors so callers don't mistake an API
 // outage (503, captive portal) for "not connected to Mullvad".
 func TestIsConnected_ErrorOnNon2xx(t *testing.T) {
@@ -192,6 +226,89 @@ func TestIsConnected_ErrorOnNon2xx(t *testing.T) {
 
 	if _, err := IsConnected(t.Context()); err == nil {
 		t.Fatal("expected error on 503")
+	}
+}
+
+// StartUpdater must run an initial update, then continue firing on its
+// ticker until ctx is canceled, and close the errors channel on exit.
+// Uses a short interval so the second update fires inside the test timeout.
+func TestStartUpdater_RunsAndTicksAndCloses(t *testing.T) {
+	Relays.Store(nil)
+	t.Cleanup(func() { Relays.Store(nil) })
+
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"v1"`)
+		if r.Method == http.MethodGet {
+			_, _ = w.Write([]byte(relayJSON))
+		}
+		hits.Add(1)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	cfg := MullvadConfig{
+		RelayURL:       srv.URL,
+		DataFile:       filepath.Join(dir, "relays.json"),
+		MetaFile:       filepath.Join(dir, "relays.meta.json"),
+		ProxyPort:      1080,
+		UpdateInterval: 20 * time.Millisecond,
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	errs := StartUpdater(ctx, cfg)
+
+	// Wait until ticker has fired at least once past the initial update.
+	deadline := time.Now().Add(2 * time.Second)
+	for hits.Load() < 3 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if hits.Load() < 3 {
+		t.Fatalf("expected >=3 server hits (1 initial GET + subsequent HEADs), got %d", hits.Load())
+	}
+
+	cancel()
+	// Channel must close after ctx done.
+	select {
+	case _, ok := <-errs:
+		if ok {
+			// drain remaining errors until closed
+			for range errs {
+			}
+		}
+	case <-time.After(time.Second):
+		t.Fatal("errs channel not closed after ctx cancel")
+	}
+}
+
+// StartUpdater must surface update errors on the returned channel. A HEAD
+// that returns 500 is the simplest way to force an error on the initial tick.
+func TestStartUpdater_SurfacesErrorOnChannel(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	cfg := MullvadConfig{
+		RelayURL:       srv.URL,
+		DataFile:       filepath.Join(dir, "relays.json"),
+		MetaFile:       filepath.Join(dir, "relays.meta.json"),
+		ProxyPort:      1080,
+		UpdateInterval: time.Hour,
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	errs := StartUpdater(ctx, cfg)
+
+	select {
+	case err := <-errs:
+		if err == nil {
+			t.Fatal("expected non-nil error from initial update")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no error surfaced")
 	}
 }
 

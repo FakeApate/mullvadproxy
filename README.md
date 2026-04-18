@@ -14,19 +14,27 @@ Package mullvadproxy provides a client for the Mullvad VPN relay list API and he
 maxWeight := 99
 proxyCount := 10
 
-cfg := mullvadproxy.DefaultMullvadConfig()
-connected, err := mullvadproxy.IsConnected()
+ctx, cancel := context.WithCancel(context.Background())
+defer cancel()
 
+cfg := mullvadproxy.DefaultMullvadConfig()
+
+connected, err := mullvadproxy.IsConnected(ctx)
 if err != nil || !connected {
     panic(err)
 }
+
+errs := mullvadproxy.StartUpdater(ctx, cfg)
+go func() {
+    for err := range errs {
+        log.Println("updater:", err)
+    }
+}()
 
 weightFilter := func(num int) bool { return num <= maxWeight }
 relayFilter := mullvadproxy.RelayFilter{Weight: weightFilter}
 
 proxies, err := mullvadproxy.SelectProxies(cfg, proxyCount, relayFilter)
-
-mullvadproxy.StartUpdater(cfg)
 ```
 
 ## Development

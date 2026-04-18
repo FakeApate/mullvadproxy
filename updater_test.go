@@ -185,9 +185,130 @@ func TestUpdate_ReturnsErrorOnHTTPFailure(t *testing.T) {
 // an error instead would break the cold-start path.
 func TestLoadMeta_MissingFileReturnsZero(t *testing.T) {
 	cfg := newTestCfg(t, "http://unused")
-	m := loadMeta(cfg)
+	m, err := loadMeta(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if m.ETag != "" || !m.LastModified.IsZero() {
 		t.Fatalf("want zero metadata, got %+v", m)
+	}
+}
+
+// Corrupt meta file must surface as an error rather than being silently
+// treated as zero — the library leaves that decision to the caller.
+func TestLoadMeta_CorruptFileReturnsError(t *testing.T) {
+	cfg := newTestCfg(t, "http://unused")
+	if err := os.WriteFile(cfg.MetaFile, []byte("not json"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadMeta(cfg); err == nil {
+		t.Fatal("expected error on corrupt meta")
+	}
+}
+
+// Corrupt meta must propagate from loadMeta through update. Without this,
+// update would silently act on zero metadata and spuriously refetch (or
+// worse, hide disk corruption from the caller).
+func TestUpdate_ReturnsErrorOnCorruptMeta(t *testing.T) {
+	Relays.Store(nil)
+	srv, _, _ := newServer(t, `"v1"`, "")
+	defer srv.Close()
+	cfg := newTestCfg(t, srv.URL)
+	if err := os.WriteFile(cfg.MetaFile, []byte("not json"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := update(t.Context(), cfg); err == nil {
+		t.Fatal("expected error on corrupt meta")
+	}
+}
+
+// Cold start with a corrupt on-disk cache must fall back to a network
+// fetch rather than propagating the parse error. This is the recovery path
+// for partial writes / disk corruption.
+func TestUpdate_RefetchesWhenDiskCacheCorrupt(t *testing.T) {
+	Relays.Store(nil)
+	t.Cleanup(func() { Relays.Store(nil) })
+	// HEAD returns no ETag/Last-Modified so remoteIsNewer is false → exercise
+	// the cold-start "try disk, else fetch" branch.
+	srv, _, getCount := newServer(t, "", "")
+	defer srv.Close()
+	cfg := newTestCfg(t, srv.URL)
+	if err := os.WriteFile(cfg.DataFile, []byte("garbage"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := update(t.Context(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if *getCount != 1 {
+		t.Fatalf("want 1 GET fallback, got %d", *getCount)
+	}
+	if Relays.Load() == nil {
+		t.Fatal("relays not parsed after refetch")
+	}
+}
+
+// HEAD returns 2xx but GET returns 5xx — the new status guard in fetch must
+// reject the body rather than writing a 500 error page to DataFile and then
+// failing to parse it.
+func TestFetch_RejectsNon2xxGET(t *testing.T) {
+	Relays.Store(nil)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"v1"`)
+		if r.Method == http.MethodGet {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer srv.Close()
+	cfg := newTestCfg(t, srv.URL)
+
+	if err := update(t.Context(), cfg); err == nil {
+		t.Fatal("expected error on GET 500")
+	}
+	if _, err := os.Stat(cfg.DataFile); err == nil {
+		t.Fatal("DataFile must not be written when GET fails")
+	}
+}
+
+// fetch must surface disk write errors. Pointing DataFile at a path whose
+// parent directory does not exist is the simplest way to force WriteFile
+// to fail without relying on permissions.
+func TestFetch_SurfacesDataFileWriteError(t *testing.T) {
+	Relays.Store(nil)
+	srv, _, _ := newServer(t, `"v1"`, "")
+	defer srv.Close()
+	cfg := newTestCfg(t, srv.URL)
+	cfg.DataFile = filepath.Join(cfg.DataFile, "does", "not", "exist", "relays.json")
+
+	if err := update(t.Context(), cfg); err == nil {
+		t.Fatal("expected DataFile write error")
+	}
+}
+
+// Same for the meta file: a failure to persist meta must be surfaced so
+// callers know the freshness check for the next tick is unreliable.
+func TestFetch_SurfacesMetaFileWriteError(t *testing.T) {
+	Relays.Store(nil)
+	srv, _, _ := newServer(t, `"v1"`, "")
+	defer srv.Close()
+	cfg := newTestCfg(t, srv.URL)
+	cfg.MetaFile = filepath.Join(cfg.MetaFile, "does", "not", "exist", "meta.json")
+
+	if err := update(t.Context(), cfg); err == nil {
+		t.Fatal("expected MetaFile write error")
+	}
+}
+
+// HEAD transport failure (server closed before request) must surface so the
+// updater caller can log it. Covers the httpClient.Do error branch in update.
+func TestUpdate_ReturnsErrorOnHEADTransportFailure(t *testing.T) {
+	Relays.Store(nil)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	srv.Close() // immediately
+	cfg := newTestCfg(t, srv.URL)
+
+	if err := update(t.Context(), cfg); err == nil {
+		t.Fatal("expected transport error")
 	}
 }
 

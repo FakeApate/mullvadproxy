@@ -55,7 +55,10 @@ func update(ctx context.Context, cfg MullvadConfig) error {
 	remoteETag := resp.Header.Get("ETag")
 	remoteLastModified, _ := time.Parse(time.RFC1123, resp.Header.Get("Last-Modified"))
 
-	meta := loadMeta(cfg)
+	meta, err := loadMeta(cfg)
+	if err != nil {
+		return err
+	}
 
 	remoteIsNewer := (remoteETag != "" && remoteETag != meta.ETag) ||
 		(!remoteLastModified.IsZero() && remoteLastModified.After(meta.LastModified))
@@ -93,6 +96,9 @@ func fetch(ctx context.Context, cfg MullvadConfig, etag string, lastModified tim
 		return err
 	}
 	defer func() { err = errors.Join(err, resp.Body.Close()) }()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("GET %s: status %d", cfg.RelayURL, resp.StatusCode)
+	}
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -126,17 +132,21 @@ func parse(cfg MullvadConfig) error {
 	return nil
 }
 
-// loadMeta returns the persisted freshness metadata from cfg.MetaFile, or a
-// zero value if the file is missing or unreadable. A zero metadata forces
-// update to treat the remote as newer on the next call.
-func loadMeta(cfg MullvadConfig) metadata {
+// loadMeta returns the persisted freshness metadata from cfg.MetaFile.
+// A missing file yields a zero metadata and nil error (expected on cold
+// start). Read or unmarshal failures are returned to the caller — the
+// library does not decide whether corrupt metadata should be ignored.
+func loadMeta(cfg MullvadConfig) (metadata, error) {
 	data, err := os.ReadFile(cfg.MetaFile)
 	if err != nil {
-		return metadata{}
+		if errors.Is(err, os.ErrNotExist) {
+			return metadata{}, nil
+		}
+		return metadata{}, err
 	}
 	var meta metadata
 	if err := json.Unmarshal(data, &meta); err != nil {
-		return metadata{}
+		return metadata{}, err
 	}
-	return meta
+	return meta, nil
 }
