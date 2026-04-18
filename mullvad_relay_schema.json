@@ -1,0 +1,126 @@
+{
+    "$schema": "http://json-schema.org/draft-06/schema#",
+    "$ref": "#/definitions/MullvadRelays",
+    "definitions": {
+        "MullvadRelays": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "locations": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "$ref": "#/definitions/Location"
+                    }
+                },
+                "wireguard": {
+                    "$ref": "#/definitions/WireguardEndpoints"
+                }
+            },
+            "required": [
+                "locations",
+                "wireguard"
+            ],
+            "title": "MullvadRelays"
+        },
+        "Location": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "country": {
+                    "type": "string"
+                },
+                "city": {
+                    "type": "string"
+                },
+                "latitude": {
+                    "type": "number"
+                },
+                "longitude": {
+                    "type": "number"
+                }
+            },
+            "required": [
+                "city",
+                "country",
+                "latitude",
+                "longitude"
+            ],
+            "title": "Location"
+        },
+        "WireguardEndpoints": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "relays": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/Relay"
+                    }
+                },
+                "port_ranges": {
+                    "type": "array",
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "integer"
+                        }
+                    }
+                },
+                "ipv4_gateway": {
+                    "type": "string"
+                },
+                "ipv6_gateway": {
+                    "type": "string"
+                }
+            },
+            "required": [
+                "ipv4_gateway",
+                "ipv6_gateway",
+                "port_ranges",
+                "relays"
+            ],
+            "title": "WireguardEndpoints"
+        },
+        "Relay": {
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+                "hostname": {
+                    "type": "string"
+                },
+                "location": {
+                    "type": "string"
+                },
+                "active": {
+                    "type": "boolean"
+                },
+                "ipv4_addr_in": {
+                    "type": "string"
+                },
+                "include_in_country": {
+                    "type": "boolean"
+                },
+                "weight": {
+                    "type": "integer"
+                },
+                "public_key": {
+                    "type": "string"
+                },
+                "ipv6_addr_in": {
+                    "type": "string"
+                }
+            },
+            "required": [
+                "active",
+                "hostname",
+                "include_in_country",
+                "ipv4_addr_in",
+                "ipv6_addr_in",
+                "location",
+                "public_key",
+                "weight"
+            ],
+            "title": "Relay"
+        }
+    }
+}

@@ -1,0 +1,25 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "$ref": "#/definitions/AmIConnected",
+    "definitions": {
+        "AmIConnected": {
+            "title": "AmIConnected",
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+                "ip": {
+                    "type": "string"
+                },
+                "mullvad_exit_ip": {
+                    "type": "boolean"
+                },
+                "mullvad_exit_ip_hostname": {
+                    "type": "string"
+                }
+            },
+            "required": [
+                "mullvad_exit_ip"
+            ]
+        }
+    }
+}
