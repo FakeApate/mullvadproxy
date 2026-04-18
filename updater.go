@@ -4,13 +4,25 @@
 package mullvadproxy
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"sync/atomic"
 	"time"
 )
+
+// Relays holds the most recently loaded Mullvad relay list.
+// Readers call Relays.Load(); a nil return means no list is loaded yet.
+// Writes happen only from update (single-writer, many-reader).
+var Relays atomic.Pointer[MullvadRelays]
+
+// httpClient is the shared client used for all outbound Mullvad API calls.
+// Timeout covers the full request; per-call cancellation is via context.
+var httpClient = &http.Client{Timeout: 30 * time.Second}
 
 // metadata stores the ETag and Last-Modified values from the last successful fetch,
 // persisted to disk so freshness checks survive restarts.
@@ -24,12 +36,18 @@ type metadata struct {
 // Last-Modified indicates newer content. On cold start (Relays == nil) it
 // prefers the on-disk cache and only falls back to a network fetch if that
 // cache is missing or corrupt.
-func update(cfg MullvadConfig) error {
-	resp, err := http.Head(cfg.RelayURL)
+func update(ctx context.Context, cfg MullvadConfig) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, cfg.RelayURL, nil)
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	if err := resp.Body.Close(); err != nil {
+		return err
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("HEAD %s: status %d", cfg.RelayURL, resp.StatusCode)
 	}
@@ -37,23 +55,26 @@ func update(cfg MullvadConfig) error {
 	remoteETag := resp.Header.Get("ETag")
 	remoteLastModified, _ := time.Parse(time.RFC1123, resp.Header.Get("Last-Modified"))
 
-	meta := loadMeta(cfg)
+	meta, err := loadMeta(cfg)
+	if err != nil {
+		return err
+	}
 
 	remoteIsNewer := (remoteETag != "" && remoteETag != meta.ETag) ||
 		(!remoteLastModified.IsZero() && remoteLastModified.After(meta.LastModified))
 
 	if remoteIsNewer {
-		if err := fetch(cfg, remoteETag, remoteLastModified); err != nil {
+		if err := fetch(ctx, cfg, remoteETag, remoteLastModified); err != nil {
 			return err
 		}
 		return parse(cfg)
 	}
 
-	if Relays == nil {
+	if Relays.Load() == nil {
 		if err := parse(cfg); err == nil {
 			return nil
 		}
-		if err := fetch(cfg, remoteETag, remoteLastModified); err != nil {
+		if err := fetch(ctx, cfg, remoteETag, remoteLastModified); err != nil {
 			return err
 		}
 		return parse(cfg)
@@ -65,12 +86,19 @@ func update(cfg MullvadConfig) error {
 // fetch downloads the relay list, writes it to cfg.DataFile, and records the
 // supplied etag and lastModified to cfg.MetaFile so the next update call can
 // short-circuit when the remote has not changed.
-func fetch(cfg MullvadConfig, etag string, lastModified time.Time) error {
-	resp, err := http.Get(cfg.RelayURL)
+func fetch(ctx context.Context, cfg MullvadConfig, etag string, lastModified time.Time) (err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cfg.RelayURL, nil)
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, resp.Body.Close()) }()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("GET %s: status %d", cfg.RelayURL, resp.StatusCode)
+	}
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -100,19 +128,25 @@ func parse(cfg MullvadConfig) error {
 	if err := json.Unmarshal(data, &relays); err != nil {
 		return err
 	}
-	Relays = &relays
+	Relays.Store(&relays)
 	return nil
 }
 
-// loadMeta returns the persisted freshness metadata from cfg.MetaFile, or a
-// zero value if the file is missing or unreadable. A zero metadata forces
-// update to treat the remote as newer on the next call.
-func loadMeta(cfg MullvadConfig) metadata {
+// loadMeta returns the persisted freshness metadata from cfg.MetaFile.
+// A missing file yields a zero metadata and nil error (expected on cold
+// start). Read or unmarshal failures are returned to the caller — the
+// library does not decide whether corrupt metadata should be ignored.
+func loadMeta(cfg MullvadConfig) (metadata, error) {
 	data, err := os.ReadFile(cfg.MetaFile)
 	if err != nil {
-		return metadata{}
+		if errors.Is(err, os.ErrNotExist) {
+			return metadata{}, nil
+		}
+		return metadata{}, err
 	}
 	var meta metadata
-	json.Unmarshal(data, &meta)
-	return meta
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return metadata{}, err
+	}
+	return meta, nil
 }

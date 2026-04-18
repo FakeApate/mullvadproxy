@@ -1,11 +1,15 @@
 package mullvadproxy
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"regexp"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func makeRelays() *MullvadRelays {
@@ -28,7 +32,7 @@ func makeRelays() *MullvadRelays {
 // Guards the nil-guard in SelectProxies so callers get a clear error instead of
 // a nil-pointer panic when invoked before the relay list is loaded.
 func TestSelectProxies_NoRelaysLoaded(t *testing.T) {
-	Relays = nil
+	Relays.Store(nil)
 	_, err := SelectProxies(DefaultMullvadConfig(), 0, RelayFilter{})
 	if err == nil {
 		t.Fatal("expected error when relay list not loaded")
@@ -39,8 +43,8 @@ func TestSelectProxies_NoRelaysLoaded(t *testing.T) {
 // These flags are Mullvad's signal that a relay is unhealthy or geo-misclassified,
 // so leaking them as proxies would route traffic through broken endpoints.
 func TestSelectProxies_SkipsInactiveAndExcluded(t *testing.T) {
-	Relays = makeRelays()
-	t.Cleanup(func() { Relays = nil })
+	Relays.Store(makeRelays())
+	t.Cleanup(func() { Relays.Store(nil) })
 
 	got, err := SelectProxies(DefaultMullvadConfig(), 0, RelayFilter{})
 	if err != nil {
@@ -62,8 +66,8 @@ func TestSelectProxies_SkipsInactiveAndExcluded(t *testing.T) {
 // Mullvad exposes SOCKS5 on a sibling host, so any regression here produces
 // proxy URLs that connect to the wireguard endpoint instead and silently fail.
 func TestSelectProxies_HostnameRewriteAndPort(t *testing.T) {
-	Relays = makeRelays()
-	t.Cleanup(func() { Relays = nil })
+	Relays.Store(makeRelays())
+	t.Cleanup(func() { Relays.Store(nil) })
 
 	cfg := DefaultMullvadConfig()
 	cfg.ProxyPort = 443
@@ -81,8 +85,8 @@ func TestSelectProxies_HostnameRewriteAndPort(t *testing.T) {
 // to pin traffic to a country/city, so a broken match would silently route
 // through wrong jurisdictions.
 func TestSelectProxies_LocationFilter(t *testing.T) {
-	Relays = makeRelays()
-	t.Cleanup(func() { Relays = nil })
+	Relays.Store(makeRelays())
+	t.Cleanup(func() { Relays.Store(nil) })
 
 	got, _ := SelectProxies(DefaultMullvadConfig(), 0, RelayFilter{Location: regexp.MustCompile("^se-")})
 	if len(got) != 2 {
@@ -94,8 +98,8 @@ func TestSelectProxies_LocationFilter(t *testing.T) {
 // AdditionalProperties (map[string]any type-assert path), so this catches
 // regressions in the nested lookup as well as the boolean match.
 func TestSelectProxies_OwnedFilter(t *testing.T) {
-	Relays = makeRelays()
-	t.Cleanup(func() { Relays = nil })
+	Relays.Store(makeRelays())
+	t.Cleanup(func() { Relays.Store(nil) })
 
 	yes := true
 	owned, _ := SelectProxies(DefaultMullvadConfig(), 0, RelayFilter{Owned: &yes})
@@ -113,8 +117,8 @@ func TestSelectProxies_OwnedFilter(t *testing.T) {
 // Callers use this to bias toward high-capacity relays; a no-op filter
 // would spread load to low-weight hosts.
 func TestSelectProxies_WeightFilter(t *testing.T) {
-	Relays = makeRelays()
-	t.Cleanup(func() { Relays = nil })
+	Relays.Store(makeRelays())
+	t.Cleanup(func() { Relays.Store(nil) })
 
 	got, _ := SelectProxies(DefaultMullvadConfig(), 0, RelayFilter{Weight: func(w int) bool { return w >= 100 }})
 	if len(got) != 2 { // se-got=100, se-sto=200
@@ -125,8 +129,8 @@ func TestSelectProxies_WeightFilter(t *testing.T) {
 // Verifies the early-exit on limit. Off-by-one here would either return
 // limit+1 results or loop over every relay unnecessarily on large lists.
 func TestSelectProxies_Limit(t *testing.T) {
-	Relays = makeRelays()
-	t.Cleanup(func() { Relays = nil })
+	Relays.Store(makeRelays())
+	t.Cleanup(func() { Relays.Store(nil) })
 
 	got, _ := SelectProxies(DefaultMullvadConfig(), 2, RelayFilter{})
 	if len(got) != 2 {
@@ -147,7 +151,7 @@ func TestIsConnected_True(t *testing.T) {
 	AmIConnectedURL = srv.URL
 	t.Cleanup(func() { AmIConnectedURL = orig })
 
-	ok, err := IsConnected()
+	ok, err := IsConnected(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,12 +173,42 @@ func TestIsConnected_False(t *testing.T) {
 	AmIConnectedURL = srv.URL
 	t.Cleanup(func() { AmIConnectedURL = orig })
 
-	ok, err := IsConnected()
+	ok, err := IsConnected(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if ok {
 		t.Fatal("expected IsConnected=false")
+	}
+}
+
+// Transport failure (unreachable host) must surface as an error. Silently
+// returning false would be indistinguishable from "connected via a non-Mullvad
+// exit" and lead callers to wrong conclusions during outages.
+func TestIsConnected_TransportError(t *testing.T) {
+	orig := AmIConnectedURL
+	AmIConnectedURL = "http://127.0.0.1:1"
+	t.Cleanup(func() { AmIConnectedURL = orig })
+
+	if _, err := IsConnected(t.Context()); err == nil {
+		t.Fatal("expected transport error")
+	}
+}
+
+// Malformed body (non-JSON or JSON missing required field) must propagate
+// the decode error rather than defaulting to a false "not connected" result.
+func TestIsConnected_MalformedBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("not json"))
+	}))
+	defer srv.Close()
+
+	orig := AmIConnectedURL
+	AmIConnectedURL = srv.URL
+	t.Cleanup(func() { AmIConnectedURL = orig })
+
+	if _, err := IsConnected(t.Context()); err == nil {
+		t.Fatal("expected decode error")
 	}
 }
 
@@ -190,8 +224,91 @@ func TestIsConnected_ErrorOnNon2xx(t *testing.T) {
 	AmIConnectedURL = srv.URL
 	t.Cleanup(func() { AmIConnectedURL = orig })
 
-	if _, err := IsConnected(); err == nil {
+	if _, err := IsConnected(t.Context()); err == nil {
 		t.Fatal("expected error on 503")
+	}
+}
+
+// StartUpdater must run an initial update, then continue firing on its
+// ticker until ctx is canceled, and close the errors channel on exit.
+// Uses a short interval so the second update fires inside the test timeout.
+func TestStartUpdater_RunsAndTicksAndCloses(t *testing.T) {
+	Relays.Store(nil)
+	t.Cleanup(func() { Relays.Store(nil) })
+
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"v1"`)
+		if r.Method == http.MethodGet {
+			_, _ = w.Write([]byte(relayJSON))
+		}
+		hits.Add(1)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	cfg := MullvadConfig{
+		RelayURL:       srv.URL,
+		DataFile:       filepath.Join(dir, "relays.json"),
+		MetaFile:       filepath.Join(dir, "relays.meta.json"),
+		ProxyPort:      1080,
+		UpdateInterval: 20 * time.Millisecond,
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	errs := StartUpdater(ctx, cfg)
+
+	// Wait until ticker has fired at least once past the initial update.
+	deadline := time.Now().Add(2 * time.Second)
+	for hits.Load() < 3 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if hits.Load() < 3 {
+		t.Fatalf("expected >=3 server hits (1 initial GET + subsequent HEADs), got %d", hits.Load())
+	}
+
+	cancel()
+	// Channel must close after ctx done.
+	select {
+	case _, ok := <-errs:
+		if ok {
+			// drain remaining errors until closed
+			for range errs {
+			}
+		}
+	case <-time.After(time.Second):
+		t.Fatal("errs channel not closed after ctx cancel")
+	}
+}
+
+// StartUpdater must surface update errors on the returned channel. A HEAD
+// that returns 500 is the simplest way to force an error on the initial tick.
+func TestStartUpdater_SurfacesErrorOnChannel(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	cfg := MullvadConfig{
+		RelayURL:       srv.URL,
+		DataFile:       filepath.Join(dir, "relays.json"),
+		MetaFile:       filepath.Join(dir, "relays.meta.json"),
+		ProxyPort:      1080,
+		UpdateInterval: time.Hour,
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	errs := StartUpdater(ctx, cfg)
+
+	select {
+	case err := <-errs:
+		if err == nil {
+			t.Fatal("expected non-nil error from initial update")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no error surfaced")
 	}
 }
 
