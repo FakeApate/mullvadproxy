@@ -27,10 +27,6 @@ import (
 	"time"
 )
 
-// Relays holds the most recently loaded Mullvad relay list.
-// It is nil until the first successful parse completes.
-var Relays *MullvadRelays
-
 // AmIConnectedURL is the endpoint queried by [IsConnected].
 // Exposed as a variable so tests can point it at an httptest server.
 var AmIConnectedURL = "https://am.i.mullvad.net/json"
@@ -112,13 +108,14 @@ type RelayFilter struct {
 // formatted as socks5://hostname:<port> for use with colly's proxy switcher.
 // limit <= 0 means no limit. Reports an error if the relay list is not loaded.
 func SelectProxies(cfg MullvadConfig, limit int, filter RelayFilter) ([]string, error) {
-	if Relays == nil {
+	snapshot := Relays.Load()
+	if snapshot == nil {
 		return nil, errors.New("relay list not loaded")
 	}
 
 	port := strconv.Itoa(cfg.ProxyPort)
 	var results []string
-	for _, relay := range Relays.Wireguard.Relays {
+	for _, relay := range snapshot.Wireguard.Relays {
 		if !relay.Active || !relay.IncludeInCountry {
 			continue
 		}

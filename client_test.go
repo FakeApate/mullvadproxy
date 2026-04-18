@@ -28,7 +28,7 @@ func makeRelays() *MullvadRelays {
 // Guards the nil-guard in SelectProxies so callers get a clear error instead of
 // a nil-pointer panic when invoked before the relay list is loaded.
 func TestSelectProxies_NoRelaysLoaded(t *testing.T) {
-	Relays = nil
+	Relays.Store(nil)
 	_, err := SelectProxies(DefaultMullvadConfig(), 0, RelayFilter{})
 	if err == nil {
 		t.Fatal("expected error when relay list not loaded")
@@ -39,8 +39,8 @@ func TestSelectProxies_NoRelaysLoaded(t *testing.T) {
 // These flags are Mullvad's signal that a relay is unhealthy or geo-misclassified,
 // so leaking them as proxies would route traffic through broken endpoints.
 func TestSelectProxies_SkipsInactiveAndExcluded(t *testing.T) {
-	Relays = makeRelays()
-	t.Cleanup(func() { Relays = nil })
+	Relays.Store(makeRelays())
+	t.Cleanup(func() { Relays.Store(nil) })
 
 	got, err := SelectProxies(DefaultMullvadConfig(), 0, RelayFilter{})
 	if err != nil {
@@ -62,8 +62,8 @@ func TestSelectProxies_SkipsInactiveAndExcluded(t *testing.T) {
 // Mullvad exposes SOCKS5 on a sibling host, so any regression here produces
 // proxy URLs that connect to the wireguard endpoint instead and silently fail.
 func TestSelectProxies_HostnameRewriteAndPort(t *testing.T) {
-	Relays = makeRelays()
-	t.Cleanup(func() { Relays = nil })
+	Relays.Store(makeRelays())
+	t.Cleanup(func() { Relays.Store(nil) })
 
 	cfg := DefaultMullvadConfig()
 	cfg.ProxyPort = 443
@@ -81,8 +81,8 @@ func TestSelectProxies_HostnameRewriteAndPort(t *testing.T) {
 // to pin traffic to a country/city, so a broken match would silently route
 // through wrong jurisdictions.
 func TestSelectProxies_LocationFilter(t *testing.T) {
-	Relays = makeRelays()
-	t.Cleanup(func() { Relays = nil })
+	Relays.Store(makeRelays())
+	t.Cleanup(func() { Relays.Store(nil) })
 
 	got, _ := SelectProxies(DefaultMullvadConfig(), 0, RelayFilter{Location: regexp.MustCompile("^se-")})
 	if len(got) != 2 {
@@ -94,8 +94,8 @@ func TestSelectProxies_LocationFilter(t *testing.T) {
 // AdditionalProperties (map[string]any type-assert path), so this catches
 // regressions in the nested lookup as well as the boolean match.
 func TestSelectProxies_OwnedFilter(t *testing.T) {
-	Relays = makeRelays()
-	t.Cleanup(func() { Relays = nil })
+	Relays.Store(makeRelays())
+	t.Cleanup(func() { Relays.Store(nil) })
 
 	yes := true
 	owned, _ := SelectProxies(DefaultMullvadConfig(), 0, RelayFilter{Owned: &yes})
@@ -113,8 +113,8 @@ func TestSelectProxies_OwnedFilter(t *testing.T) {
 // Callers use this to bias toward high-capacity relays; a no-op filter
 // would spread load to low-weight hosts.
 func TestSelectProxies_WeightFilter(t *testing.T) {
-	Relays = makeRelays()
-	t.Cleanup(func() { Relays = nil })
+	Relays.Store(makeRelays())
+	t.Cleanup(func() { Relays.Store(nil) })
 
 	got, _ := SelectProxies(DefaultMullvadConfig(), 0, RelayFilter{Weight: func(w int) bool { return w >= 100 }})
 	if len(got) != 2 { // se-got=100, se-sto=200
@@ -125,8 +125,8 @@ func TestSelectProxies_WeightFilter(t *testing.T) {
 // Verifies the early-exit on limit. Off-by-one here would either return
 // limit+1 results or loop over every relay unnecessarily on large lists.
 func TestSelectProxies_Limit(t *testing.T) {
-	Relays = makeRelays()
-	t.Cleanup(func() { Relays = nil })
+	Relays.Store(makeRelays())
+	t.Cleanup(func() { Relays.Store(nil) })
 
 	got, _ := SelectProxies(DefaultMullvadConfig(), 2, RelayFilter{})
 	if len(got) != 2 {

@@ -59,7 +59,7 @@ func newServer(t *testing.T, etag, lastMod string) (*httptest.Server, *int, *int
 // This is the first-ever-run scenario; a regression would leave Relays nil
 // and every SelectProxies call failing.
 func TestUpdate_FetchesWhenNoCache(t *testing.T) {
-	Relays = nil
+	Relays.Store(nil)
 	srv, _, getCount := newServer(t, `"v1"`, time.Now().UTC().Format(time.RFC1123))
 	defer srv.Close()
 	cfg := newTestCfg(t, srv.URL)
@@ -70,20 +70,20 @@ func TestUpdate_FetchesWhenNoCache(t *testing.T) {
 	if *getCount != 1 {
 		t.Fatalf("want 1 GET, got %d", *getCount)
 	}
-	if Relays == nil || len(Relays.Wireguard.Relays) != 1 {
+	if r := Relays.Load(); r == nil || len(r.Wireguard.Relays) != 1 {
 		t.Fatal("relays not parsed")
 	}
 	if _, err := os.Stat(cfg.DataFile); err != nil {
 		t.Fatal("data file not written")
 	}
-	Relays = nil
+	Relays.Store(nil)
 }
 
 // Regression test for the bug fixed earlier: when Relays==nil but the disk
 // cache is valid and the remote ETag matches, update must parse from disk
 // instead of refetching. Counts GETs to prove no network fetch happens.
 func TestUpdate_UsesDiskCacheWhenETagMatches(t *testing.T) {
-	Relays = nil
+	Relays.Store(nil)
 	etag := `"v1"`
 	srv, _, getCount := newServer(t, etag, "")
 	defer srv.Close()
@@ -107,17 +107,17 @@ func TestUpdate_UsesDiskCacheWhenETagMatches(t *testing.T) {
 	if *getCount != 0 {
 		t.Fatalf("want 0 GET (cache hit), got %d", *getCount)
 	}
-	if Relays == nil {
+	if Relays.Load() == nil {
 		t.Fatal("expected relays parsed from disk cache")
 	}
-	Relays = nil
+	Relays.Store(nil)
 }
 
 // Steady-state tick: Relays already in memory, remote unchanged → no-op.
 // Protects against wasted bandwidth and unnecessary disk writes on the
 // hourly ticker when nothing has changed.
 func TestUpdate_SkipsWhenRelaysLoadedAndETagMatches(t *testing.T) {
-	Relays = makeRelays()
+	Relays.Store(makeRelays())
 	etag := `"v2"`
 	srv, _, getCount := newServer(t, etag, "")
 	defer srv.Close()
@@ -136,14 +136,14 @@ func TestUpdate_SkipsWhenRelaysLoadedAndETagMatches(t *testing.T) {
 	if *getCount != 0 {
 		t.Fatalf("want 0 GET, got %d", *getCount)
 	}
-	Relays = nil
+	Relays.Store(nil)
 }
 
 // ETag mismatch must trigger a refetch even when Relays is already loaded.
 // Without this, the client would serve stale relay data indefinitely after
 // Mullvad publishes a new list.
 func TestUpdate_FetchesWhenETagChanged(t *testing.T) {
-	Relays = makeRelays()
+	Relays.Store(makeRelays())
 	srv, _, getCount := newServer(t, `"new"`, "")
 	defer srv.Close()
 	cfg := newTestCfg(t, srv.URL)
@@ -161,14 +161,14 @@ func TestUpdate_FetchesWhenETagChanged(t *testing.T) {
 	if *getCount != 1 {
 		t.Fatalf("want 1 GET, got %d", *getCount)
 	}
-	Relays = nil
+	Relays.Store(nil)
 }
 
 // Non-2xx HEAD must surface as an error so StartUpdater can log it.
 // Previously a 500 would pass the nil-err check and feed junk headers into
 // the freshness comparison, potentially overwriting the cache with garbage.
 func TestUpdate_ReturnsErrorOnHTTPFailure(t *testing.T) {
-	Relays = nil
+	Relays.Store(nil)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))

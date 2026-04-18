@@ -11,8 +11,14 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sync/atomic"
 	"time"
 )
+
+// Relays holds the most recently loaded Mullvad relay list.
+// Readers call Relays.Load(); a nil return means no list is loaded yet.
+// Writes happen only from update (single-writer, many-reader).
+var Relays atomic.Pointer[MullvadRelays]
 
 // httpClient is the shared client used for all outbound Mullvad API calls.
 // Timeout covers the full request; per-call cancellation is via context.
@@ -61,7 +67,7 @@ func update(ctx context.Context, cfg MullvadConfig) error {
 		return parse(cfg)
 	}
 
-	if Relays == nil {
+	if Relays.Load() == nil {
 		if err := parse(cfg); err == nil {
 			return nil
 		}
@@ -116,7 +122,7 @@ func parse(cfg MullvadConfig) error {
 	if err := json.Unmarshal(data, &relays); err != nil {
 		return err
 	}
-	Relays = &relays
+	Relays.Store(&relays)
 	return nil
 }
 
