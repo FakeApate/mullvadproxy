@@ -37,8 +37,18 @@ var AmIConnectedURL = "https://am.i.mullvad.net/json"
 // the channel is closed when ctx is done. Consumers that do not want
 // errors can drain or ignore the channel — the buffer is small, so
 // persistent backpressure drops errors rather than blocking updates.
+//
+// The caller must set cfg.UpdateInterval to a positive duration; if it
+// is zero or negative, StartUpdater surfaces an error on the channel
+// and closes it without starting the update loop. Use
+// [DefaultMullvadConfig] for a working baseline.
 func StartUpdater(ctx context.Context, cfg MullvadConfig) <-chan error {
 	errs := make(chan error, 1)
+	if cfg.UpdateInterval <= 0 {
+		errs <- fmt.Errorf("mullvadproxy: UpdateInterval must be positive, got %s", cfg.UpdateInterval)
+		close(errs)
+		return errs
+	}
 	go func() {
 		defer close(errs)
 		send := func(err error) {

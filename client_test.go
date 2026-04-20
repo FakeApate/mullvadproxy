@@ -281,6 +281,40 @@ func TestStartUpdater_RunsAndTicksAndCloses(t *testing.T) {
 	}
 }
 
+// StartUpdater must reject a non-positive UpdateInterval up front rather than
+// panicking from time.NewTicker. The error is surfaced on the channel and the
+// channel is closed without starting the update loop.
+func TestStartUpdater_RejectsNonPositiveInterval(t *testing.T) {
+	for _, interval := range []time.Duration{0, -time.Second} {
+		t.Run(interval.String(), func(t *testing.T) {
+			cfg := DefaultMullvadConfig()
+			cfg.UpdateInterval = interval
+
+			errs := StartUpdater(t.Context(), cfg)
+
+			var got error
+			select {
+			case got = <-errs:
+			case <-time.After(time.Second):
+				t.Fatal("expected an error, got none")
+			}
+			if got == nil {
+				t.Fatal("expected non-nil error")
+			}
+
+			// Channel must be closed (no update loop started).
+			select {
+			case _, ok := <-errs:
+				if ok {
+					t.Fatal("channel should be closed after rejecting config")
+				}
+			case <-time.After(time.Second):
+				t.Fatal("channel not closed")
+			}
+		})
+	}
+}
+
 // StartUpdater must surface update errors on the returned channel. A HEAD
 // that returns 500 is the simplest way to force an error on the initial tick.
 func TestStartUpdater_SurfacesErrorOnChannel(t *testing.T) {
